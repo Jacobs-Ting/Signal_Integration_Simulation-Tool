@@ -1,6 +1,7 @@
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.special import erfc
 
 # ==========================================
 # Core Physics & Math Engine
@@ -154,6 +155,69 @@ class TDRSimulatorCore:
         distance_mm = ((v * (np.arange(len(Z_tdr)) * (1.0 / (2 * p['fmax'] * 1e9)))) / 2) * 1000
         return distance_mm, Z_tdr.real, S11, f, IL_dB
 
+    def calculate_bathtub_curve(self, rx_steady, samps_per_ui, rj_rms_ps, sj_amp_ps, ui_ps):
+        """ 🌟 計算浴缸曲線 (基於 Dual-Dirac 統計模型) """
+        num_symbols = len(rx_steady) // samps_per_ui
+        folded = rx_steady[:num_symbols * samps_per_ui].reshape(-1, samps_per_ui)
+        
+        # 尋找眼圖的電壓中心 (Threshold) 來尋找 crossing points
+        v_thresh = np.mean(rx_steady)
+        
+        crossing_times = []
+        for i in range(num_symbols):
+            sym_wave = folded[i]
+            # 尋找零交越點
+            crossings = np.where(np.diff(np.sign(sym_wave - v_thresh)))[0]
+            for c in crossings:
+                # 線性內插求精確交越時間 (相對於 UI 起點)
+                v1, v2 = sym_wave[c] - v_thresh, sym_wave[c+1] - v_thresh
+                frac = abs(v1) / (abs(v1) + abs(v2))
+                crossing_times.append((c + frac) / samps_per_ui)
+                
+        if not crossing_times:
+            # 如果眼圖完全閉合找不到交叉點，回傳空矩陣
+            return np.linspace(0, 1, 100), np.ones(100)
+            
+        crossing_times = np.array(crossing_times)
+        
+        # 將 crossing times 對齊到 0 UI 和 1 UI 附近
+        cross_left = crossing_times[crossing_times < 0.5]
+        cross_right = crossing_times[crossing_times >= 0.5]
+        
+        # 計算 ISI (Deterministic Jitter from Channel)
+        mu_l = np.mean(cross_left) if len(cross_left) > 0 else 0
+        mu_r = np.mean(cross_right) if len(cross_right) > 0 else 1
+        sigma_isi = np.std(crossing_times) * 0.5 # 簡化估算
+        
+        # 總 DJ (Deterministic Jitter) = ISI + SJ
+        dj_ui = (sigma_isi * 2) + (2 * sj_amp_ps / ui_ps)
+        
+        # RJ 轉換為 UI 單位
+        rj_ui = rj_rms_ps / ui_ps
+        
+        # --- Dual-Dirac 浴缸曲線方程式 ---
+        t_axis = np.linspace(0, 1, 100) # 掃描 1 UI
+        ber = np.zeros_like(t_axis)
+        
+        # 為了避免除以 0，給 RJ 一個極小的底限
+        rj_ui_safe = max(rj_ui, 1e-4)
+        
+        for i, t in enumerate(t_axis):
+            # 左側邊緣 (Transition 1) 的影響
+            q_left = (t - (mu_l + dj_ui/2)) / rj_ui_safe
+            ber_left = 0.5 * 0.5 * erfc(q_left / np.sqrt(2))
+            
+            # 右側邊緣 (Transition 2) 的影響
+            q_right = ((mu_r - dj_ui/2) - t) / rj_ui_safe
+            ber_right = 0.5 * 0.5 * erfc(q_right / np.sqrt(2))
+            
+            # 總 BER 是兩側機率的疊加
+            ber[i] = ber_left + ber_right
+            
+        # 防止 BER 低於 1e-18 (數值穩定度)
+        ber = np.clip(ber, 1e-18, 0.5)
+        return t_axis, ber
+
     def measure_eye_compliance(self, rx_steady, samps_per_ui, mod_type):
         num_symbols = len(rx_steady) // samps_per_ui
         folded = rx_steady[:num_symbols * samps_per_ui].reshape(-1, samps_per_ui)
@@ -195,7 +259,23 @@ class TDRSimulatorCore:
         
         tx_pre = np.roll(tx_signal_raw, -samps_per_ui)
         tx_post = np.roll(tx_signal_raw, samps_per_ui)
-        tx_signal = p['ffe_pre'] * tx_pre + p['ffe_main'] * tx_signal_raw + p['ffe_post'] * tx_post
+        tx_signal_ideal = p['ffe_pre'] * tx_pre + p['ffe_main'] * tx_signal_raw + p['ffe_post'] * tx_post
+        
+        # Jitter Injection
+        t_ideal = np.arange(N) * dt
+        rj_rms_ps = p.get('rj_rms_ps', 0.0)    
+        sj_amp_ps = p.get('sj_amp_ps', 0.0)    
+        sj_freq_mhz = p.get('sj_freq_mhz', 10.0) 
+        
+        rj_profile = np.random.normal(0, rj_rms_ps * 1e-12, N)
+        sj_profile = (sj_amp_ps * 1e-12) * np.sin(2 * np.pi * (sj_freq_mhz * 1e6) * t_ideal)
+        
+        total_jitter = rj_profile + sj_profile
+        
+        if np.any(total_jitter != 0):
+            tx_signal = np.interp(t_ideal + total_jitter, t_ideal, tx_signal_ideal)
+        else:
+            tx_signal = tx_signal_ideal
         
         freqs = np.fft.rfftfreq(N, dt)
         f_valid = freqs[freqs <= p['fmax'] * 1e9]
@@ -211,7 +291,12 @@ class TDRSimulatorCore:
         
         rx_steady = rx_signal[100 * samps_per_ui:]
         metrics = self.measure_eye_compliance(rx_steady, samps_per_ui, p['modulation'])
-        return np.arange(N) * dt, rx_steady, ui, samps_per_ui, baud_rate_gbaud, metrics
+        
+        # 🌟 呼叫 Bathtub 演算法
+        ui_ps = ui * 1e12
+        t_bathtub, ber_curve = self.calculate_bathtub_curve(rx_steady, samps_per_ui, rj_rms_ps, sj_amp_ps, ui_ps)
+        
+        return np.arange(N) * dt, rx_steady, ui, samps_per_ui, baud_rate_gbaud, metrics, t_bathtub, ber_curve
 
 
 # ==========================================
@@ -219,14 +304,12 @@ class TDRSimulatorCore:
 # ==========================================
 st.set_page_config(page_title="SI Studio Web", layout="wide", initial_sidebar_state="expanded")
 
-# --- State Management ---
 if 'ffe_pre' not in st.session_state: st.session_state.ffe_pre = 0.0
 if 'ffe_main' not in st.session_state: st.session_state.ffe_main = 1.0
 if 'ffe_post' not in st.session_state: st.session_state.ffe_post = 0.0
 
 simulator = TDRSimulatorCore()
 
-# --- Sidebar ---
 st.sidebar.title("⚙️ System Parameters")
 
 st.sidebar.header("1. Standard & Protocol")
@@ -282,12 +365,19 @@ with col_eq1: st.session_state.ffe_pre = st.number_input("Pre (c-1)", value=st.s
 with col_eq2: st.session_state.ffe_main = st.number_input("Main (c0)", value=st.session_state.ffe_main, step=0.01)
 with col_eq3: st.session_state.ffe_post = st.number_input("Post (c+1)", value=st.session_state.ffe_post, step=0.01)
 
+st.sidebar.header("7. 🕒 Clock Jitter Injection")
+rj_rms_ps = st.sidebar.number_input("Random Jitter (RJ) RMS (ps)", value=0.0, step=0.1)
+sj_amp_ps = st.sidebar.number_input("Sinusoidal Jitter (SJ) Amp (ps)", value=0.0, step=0.1)
+sj_freq_mhz = st.sidebar.number_input("Sinusoidal Jitter (SJ) Freq (MHz)", value=10.0, step=1.0)
+
+
 p = {
     'modulation': mod_type, 'dr_gbps': dr_gbps, 'z0': z0, 'fmax': fmax,
     'er': er, 'df': df, 'zvia': zvia, 'l1': l1, 'l_active': l_active,
     'l_stub': l_stub, 'l2': l2, 'trace_w': trace_w, 'skew_ps': skew_ps, 'drill': drill,
     'ffe_pre': st.session_state.ffe_pre, 'ffe_main': st.session_state.ffe_main, 'ffe_post': st.session_state.ffe_post,
     'conn_en': conn_en, 'conn_z0': conn_z0, 'conn_len': conn_len, 'conn_c': conn_c,
+    'rj_rms_ps': rj_rms_ps, 'sj_amp_ps': sj_amp_ps, 'sj_freq_mhz': sj_freq_mhz,
     'type_l1': 'microstrip', 'type_l2': 'microstrip',
     'geom_l1_1': trace_w, 'geom_l2_1': trace_w, 'geom_l1_2': 0, 'geom_l2_2': 0
 }
@@ -300,13 +390,12 @@ if st.sidebar.button("✨ Auto-Tune FFE (SBR Zero-Forcing)", use_container_width
         st.session_state.ffe_post = c_post
         st.rerun()
 
-# --- Main Panel ---
 st.title("🚀 SI Studio Web - High-Speed Channel System Assessment")
-st.markdown("An end-to-end AI Server channel simulator based on true dielectric loss, multiple reflections, GND return path effects, and TX FFE equalization.")
+st.markdown("An end-to-end AI Server channel simulator based on true dielectric loss, multiple reflections, GND return path effects, TX FFE equalization, and **Jitter Bathtub** analysis.")
 
 with st.spinner("Executing matrix operations and waveform reconstruction..."):
     dist, z_tdr, s11_array, f_array, IL_dB = simulator.run_tdr_simulation(p)
-    t_eye, rx_steady, ui, samps_per_ui, baud_rate, metrics = simulator.run_eye_diagram(p)
+    t_eye, rx_steady, ui, samps_per_ui, baud_rate, metrics, t_bathtub, ber_curve = simulator.run_eye_diagram(p)
 
 min_z, max_z = np.min(z_tdr), np.max(z_tdr)
 nyq_f = baud_rate / 2.0
@@ -329,12 +418,18 @@ else:
 
 if p['skew_ps'] > 0:
     st.warning(f"⚠️ Skew Warning: {p['skew_ps']}ps of intra-pair skew causes an insertion loss null (destructive interference) at {1 / (2 * p['skew_ps'] * 1e-12) / 1e9:.1f} GHz.")
+    
+if p['rj_rms_ps'] > 0 or p['sj_amp_ps'] > 0:
+    st.info(f"🕒 Jitter Stress Test Active: Observe the closing Bathtub Curve at BER = 1E-12.")
 
 st.divider()
 
 plt.style.use('dark_background')
-fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 14), dpi=120)
+# 🌟 改為 2x2 陣列佈局 🌟
+fig, axs = plt.subplots(2, 2, figsize=(14, 10), dpi=120)
 fig.patch.set_facecolor('#0e1117') 
+ax1, ax2 = axs[0]
+ax3, ax4 = axs[1]
 
 # Plot 1: TDR
 max_plot_dist = total_len_mm + 15
@@ -345,7 +440,7 @@ ax1.axvspan(p['l1'], p['l1'] + p['l_active'], color='#ff5252', alpha=0.3, label=
 if p['conn_en']:
     conn_start = p['l1'] + p['l_active']
     ax1.axvspan(conn_start, conn_start + p['conn_len'], color='#ffcc00', alpha=0.3, label='Connector')
-ax1.set_title("1. TDR Impedance Profile", loc='left', color='white', fontsize=14)
+ax1.set_title("1. TDR Impedance Profile", loc='left', color='white', fontsize=12)
 ax1.grid(True, color='#333333', linestyle=':')
 ax1.set_ylim(40, 140)
 ax1.set_ylabel("Impedance (Ω)")
@@ -354,7 +449,7 @@ ax1.legend(loc='upper right')
 # Plot 2: IL
 ax2.plot(f_array/1e9, IL_dB, color='#ffcc00', linewidth=2)
 ax2.axvline(nyq_f, color='red', linestyle='--', alpha=0.5, label=f'Nyquist ({nyq_f} GHz)')
-ax2.set_title("2. Insertion Loss (S21)", loc='left', color='white', fontsize=14)
+ax2.set_title("2. Insertion Loss (S21)", loc='left', color='white', fontsize=12)
 ax2.set_xlabel("Frequency (GHz)")
 ax2.set_ylabel("dB")
 ax2.grid(True, color='#333333', linestyle=':')
@@ -376,13 +471,24 @@ ax3.axvline(center_t, color='red', linestyle=':', label='Sampling Phase')
 if p['modulation'] == "PAM4":
     for thresh in [-0.666, 0, 0.666]: ax3.axhline(thresh, color='gray', linestyle=':', alpha=0.5)
     
-ax3.set_title(f"3. Receiver Eye Diagram ({mod_type} with FFE)", loc='left', color='white', fontsize=14)
+ax3.set_title(f"3. Receiver Eye Diagram ({mod_type})", loc='left', color='white', fontsize=12)
 ax3.set_xlabel("Unit Interval (UI)")
 ax3.set_ylabel("Voltage")
 ax3.set_xlim(0, 2)
 ax3.set_ylim(-1.5, 1.5)
 ax3.grid(True, color='#333333', linestyle=':')
 ax3.legend(loc='upper right')
+
+# Plot 4: Bathtub Curve 🌟
+ax4.semilogy(t_bathtub, ber_curve, color='#ff5252', linewidth=2)
+ax4.axhline(1e-12, color='gray', linestyle='--', label='BER Target (1E-12)')
+ax4.set_title("4. Jitter Bathtub Curve (BER vs Time)", loc='left', color='white', fontsize=12)
+ax4.set_xlabel("Unit Interval (UI)")
+ax4.set_ylabel("Bit Error Rate (BER)")
+ax4.set_xlim(0, 1)
+ax4.set_ylim(1e-18, 1)
+ax4.grid(True, which='both', color='#333333', linestyle=':')
+ax4.legend(loc='upper center')
 
 fig.tight_layout(pad=3.0)
 st.pyplot(fig)
