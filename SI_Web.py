@@ -91,8 +91,29 @@ class TDRSimulatorCore:
         At, Bt, Ct, Dt = self.multiply_abcd(At, Bt, Ct, Dt, A2, B2, C2, D2)
         return At, Bt, Ct, Dt
 
+    def get_ctle_response(self, f, peaking_db, f_nyq_ghz):
+        """ 🧠 產生 RX CTLE 頻率響應 (1-Zero, 2-Pole 模型) """
+        if peaking_db <= 0:
+            return np.ones_like(f, dtype=complex)
+            
+        f_nyq = f_nyq_ghz * 1e9
+        # 將 Peaking dB 轉換為線性增益
+        G_p = 10 ** (peaking_db / 20.0)
+        
+        # 設定零極點位置 (確保 DC 增益為 0dB，Nyquist 處提升增益)
+        wz = 2 * np.pi * (f_nyq / G_p)
+        wp1 = 2 * np.pi * f_nyq
+        wp2 = 2 * np.pi * (f_nyq * 2) # 高頻抗雜訊 Roll-off
+        
+        s = 1j * 2 * np.pi * f
+        
+        # 轉換函數 H(s)
+        H = ((s + wz) / wz) * (wp1 / (s + wp1)) * (wp2 / (s + wp2))
+        return H
+
     def calculate_ffe_sbr_zeroforcing(self, p):
         baud_rate = p['dr_gbps'] / 2.0 if p['modulation'] == "PAM4" else p['dr_gbps']
+        nyq_f_ghz = baud_rate / 2.0
         ui = 1.0 / (baud_rate * 1e9)
         samps_per_ui = 32
         dt = ui / samps_per_ui
@@ -110,8 +131,12 @@ class TDRSimulatorCore:
         if p['skew_ps'] > 0:
             S21_base = S21_base * np.cos(np.pi * f_valid * (p['skew_ps'] * 1e-12))
             
+        # 🌟 套用 RX CTLE (讓 TX Link Training 知道 RX 的補償能力)
+        ctle_resp = self.get_ctle_response(f_valid, p.get('ctle_db', 0.0), nyq_f_ghz)
+        S21_total = S21_base * ctle_resp
+            
         S21 = np.zeros_like(freqs, dtype=complex)
-        S21[freqs <= p['fmax'] * 1e9] = S21_base
+        S21[freqs <= p['fmax'] * 1e9] = S21_total
         window = np.exp(-0.5 * (freqs / (p['fmax'] * 1e9 / 2.0))**2)
         rx_pulse = np.fft.irfft(np.fft.rfft(tx_pulse) * S21 * window, n=N)
         
@@ -142,10 +167,17 @@ class TDRSimulatorCore:
         
         S11 = (At*z0 + Bt - Ct*(z0**2) - Dt*z0) / denom
         S21_base = (2 * z0) / denom
-        if p['skew_ps'] > 0: S21 = S21_base * np.cos(np.pi * f * (p['skew_ps'] * 1e-12))
-        else: S21 = S21_base
-
-        IL_dB = 20 * np.log10(np.abs(S21) + 1e-12)
+        if p['skew_ps'] > 0: S21_base = S21_base * np.cos(np.pi * f * (p['skew_ps'] * 1e-12))
+        
+        # 🌟 計算顯示用的 IL (包含 RX CTLE 的等效通道響應)
+        baud_rate_gbaud = p['dr_gbps'] / 2.0 if p['modulation'] == "PAM4" else p['dr_gbps']
+        nyq_f_ghz = baud_rate_gbaud / 2.0
+        ctle_resp = self.get_ctle_response(f, p.get('ctle_db', 0.0), nyq_f_ghz)
+        S21_total = S21_base * ctle_resp
+        
+        IL_dB = 20 * np.log10(np.abs(S21_total) + 1e-12)
+        
+        # TDR 計算 (不包含 RX CTLE，因為反射是在 TX 端看的)
         f_c = p['fmax'] * 1e9 / 2.5 
         window = np.exp(-0.5 * (f / f_c)**2)
         step_response = np.cumsum(np.fft.irfft(S11 * window))
@@ -156,65 +188,43 @@ class TDRSimulatorCore:
         return distance_mm, Z_tdr.real, S11, f, IL_dB
 
     def calculate_bathtub_curve(self, rx_steady, samps_per_ui, rj_rms_ps, sj_amp_ps, ui_ps):
-        """ 🌟 計算浴缸曲線 (基於 Dual-Dirac 統計模型) """
         num_symbols = len(rx_steady) // samps_per_ui
         folded = rx_steady[:num_symbols * samps_per_ui].reshape(-1, samps_per_ui)
         
-        # 尋找眼圖的電壓中心 (Threshold) 來尋找 crossing points
         v_thresh = np.mean(rx_steady)
-        
         crossing_times = []
         for i in range(num_symbols):
             sym_wave = folded[i]
-            # 尋找零交越點
             crossings = np.where(np.diff(np.sign(sym_wave - v_thresh)))[0]
             for c in crossings:
-                # 線性內插求精確交越時間 (相對於 UI 起點)
                 v1, v2 = sym_wave[c] - v_thresh, sym_wave[c+1] - v_thresh
                 frac = abs(v1) / (abs(v1) + abs(v2))
                 crossing_times.append((c + frac) / samps_per_ui)
                 
         if not crossing_times:
-            # 如果眼圖完全閉合找不到交叉點，回傳空矩陣
             return np.linspace(0, 1, 100), np.ones(100)
             
         crossing_times = np.array(crossing_times)
-        
-        # 將 crossing times 對齊到 0 UI 和 1 UI 附近
         cross_left = crossing_times[crossing_times < 0.5]
         cross_right = crossing_times[crossing_times >= 0.5]
         
-        # 計算 ISI (Deterministic Jitter from Channel)
         mu_l = np.mean(cross_left) if len(cross_left) > 0 else 0
         mu_r = np.mean(cross_right) if len(cross_right) > 0 else 1
-        sigma_isi = np.std(crossing_times) * 0.5 # 簡化估算
-        
-        # 總 DJ (Deterministic Jitter) = ISI + SJ
+        sigma_isi = np.std(crossing_times) * 0.5 
         dj_ui = (sigma_isi * 2) + (2 * sj_amp_ps / ui_ps)
-        
-        # RJ 轉換為 UI 單位
         rj_ui = rj_rms_ps / ui_ps
         
-        # --- Dual-Dirac 浴缸曲線方程式 ---
-        t_axis = np.linspace(0, 1, 100) # 掃描 1 UI
+        t_axis = np.linspace(0, 1, 100) 
         ber = np.zeros_like(t_axis)
-        
-        # 為了避免除以 0，給 RJ 一個極小的底限
         rj_ui_safe = max(rj_ui, 1e-4)
         
         for i, t in enumerate(t_axis):
-            # 左側邊緣 (Transition 1) 的影響
             q_left = (t - (mu_l + dj_ui/2)) / rj_ui_safe
             ber_left = 0.5 * 0.5 * erfc(q_left / np.sqrt(2))
-            
-            # 右側邊緣 (Transition 2) 的影響
             q_right = ((mu_r - dj_ui/2) - t) / rj_ui_safe
             ber_right = 0.5 * 0.5 * erfc(q_right / np.sqrt(2))
-            
-            # 總 BER 是兩側機率的疊加
             ber[i] = ber_left + ber_right
             
-        # 防止 BER 低於 1e-18 (數值穩定度)
         ber = np.clip(ber, 1e-18, 0.5)
         return t_axis, ber
 
@@ -249,6 +259,7 @@ class TDRSimulatorCore:
 
     def run_eye_diagram(self, p):
         baud_rate_gbaud = p['dr_gbps'] / 2.0 if p['modulation'] == "PAM4" else p['dr_gbps']
+        nyq_f_ghz = baud_rate_gbaud / 2.0
         ui = 1.0 / (baud_rate_gbaud * 1e9) 
         samps_per_ui = 32
         dt = ui / samps_per_ui
@@ -261,7 +272,6 @@ class TDRSimulatorCore:
         tx_post = np.roll(tx_signal_raw, samps_per_ui)
         tx_signal_ideal = p['ffe_pre'] * tx_pre + p['ffe_main'] * tx_signal_raw + p['ffe_post'] * tx_post
         
-        # Jitter Injection
         t_ideal = np.arange(N) * dt
         rj_rms_ps = p.get('rj_rms_ps', 0.0)    
         sj_amp_ps = p.get('sj_amp_ps', 0.0)    
@@ -269,7 +279,6 @@ class TDRSimulatorCore:
         
         rj_profile = np.random.normal(0, rj_rms_ps * 1e-12, N)
         sj_profile = (sj_amp_ps * 1e-12) * np.sin(2 * np.pi * (sj_freq_mhz * 1e6) * t_ideal)
-        
         total_jitter = rj_profile + sj_profile
         
         if np.any(total_jitter != 0):
@@ -284,15 +293,18 @@ class TDRSimulatorCore:
         
         if p['skew_ps'] > 0: S21_base = S21_base * np.cos(np.pi * f_valid * (p['skew_ps'] * 1e-12))
             
+        # 🌟 套用 RX CTLE
+        ctle_resp = self.get_ctle_response(f_valid, p.get('ctle_db', 0.0), nyq_f_ghz)
+        S21_total = S21_base * ctle_resp
+        
         S21 = np.zeros_like(freqs, dtype=complex)
-        S21[freqs <= p['fmax'] * 1e9] = S21_base
+        S21[freqs <= p['fmax'] * 1e9] = S21_total
         window = np.exp(-0.5 * (freqs / (p['fmax'] * 1e9 / 2.0))**2)
         rx_signal = np.fft.irfft(np.fft.rfft(tx_signal) * S21 * window, n=N)
         
         rx_steady = rx_signal[100 * samps_per_ui:]
         metrics = self.measure_eye_compliance(rx_steady, samps_per_ui, p['modulation'])
         
-        # 🌟 呼叫 Bathtub 演算法
         ui_ps = ui * 1e12
         t_bathtub, ber_curve = self.calculate_bathtub_curve(rx_steady, samps_per_ui, rj_rms_ps, sj_amp_ps, ui_ps)
         
@@ -370,6 +382,9 @@ rj_rms_ps = st.sidebar.number_input("Random Jitter (RJ) RMS (ps)", value=0.0, st
 sj_amp_ps = st.sidebar.number_input("Sinusoidal Jitter (SJ) Amp (ps)", value=0.0, step=0.1)
 sj_freq_mhz = st.sidebar.number_input("Sinusoidal Jitter (SJ) Freq (MHz)", value=10.0, step=1.0)
 
+# --- 🌟 NEW: RX Equalization ---
+st.sidebar.header("8. 🧠 RX Equalization (DSP)")
+ctle_db = st.sidebar.slider("CTLE Peaking @ Nyquist (dB)", min_value=0.0, max_value=12.0, value=0.0, step=0.5)
 
 p = {
     'modulation': mod_type, 'dr_gbps': dr_gbps, 'z0': z0, 'fmax': fmax,
@@ -378,6 +393,7 @@ p = {
     'ffe_pre': st.session_state.ffe_pre, 'ffe_main': st.session_state.ffe_main, 'ffe_post': st.session_state.ffe_post,
     'conn_en': conn_en, 'conn_z0': conn_z0, 'conn_len': conn_len, 'conn_c': conn_c,
     'rj_rms_ps': rj_rms_ps, 'sj_amp_ps': sj_amp_ps, 'sj_freq_mhz': sj_freq_mhz,
+    'ctle_db': ctle_db,  # Pass CTLE parameter to engine
     'type_l1': 'microstrip', 'type_l2': 'microstrip',
     'geom_l1_1': trace_w, 'geom_l2_1': trace_w, 'geom_l1_2': 0, 'geom_l2_2': 0
 }
@@ -391,7 +407,7 @@ if st.sidebar.button("✨ Auto-Tune FFE (SBR Zero-Forcing)", use_container_width
         st.rerun()
 
 st.title("🚀 SI Studio Web - High-Speed Channel System Assessment")
-st.markdown("An end-to-end AI Server channel simulator based on true dielectric loss, multiple reflections, GND return path effects, TX FFE equalization, and **Jitter Bathtub** analysis.")
+st.markdown("An end-to-end AI Server channel simulator based on true dielectric loss, multiple reflections, GND return path effects, TX/RX Equalization (FFE & CTLE), and Jitter analysis.")
 
 with st.spinner("Executing matrix operations and waveform reconstruction..."):
     dist, z_tdr, s11_array, f_array, IL_dB = simulator.run_tdr_simulation(p)
@@ -407,25 +423,24 @@ tof_ns = total_len_mm / ((3e8 / np.sqrt(p['er'])) * 1e-6)
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Total Physical Length / ToF", f"{total_len_mm:.1f} mm", f"{tof_ns:.3f} ns delay", delta_color="off")
-col2.metric("Nyquist Loss", f"{nyq_f:.1f} GHz", f"{il_nyq:.2f} dB", delta_color="inverse")
+col2.metric("Total Loss (Channel + CTLE)", f"{nyq_f:.1f} GHz", f"{il_nyq:.2f} dB", delta_color="inverse")
 col3.metric("TDR Impedance Variation", f"{min_z:.1f} ~ {max_z:.1f} Ω", "Reflection Index", delta_color="off")
 col4.metric("Eye Spec (EH / RLM)", f"{metrics.get('EH_min_mV', metrics.get('EH_mV', 0)):.1f} mV", f"{metrics.get('RLM', 0):.3f} RLM" if mod_type == "PAM4" else "N/A", delta_color="normal" if metrics['Pass'] else "inverse")
 
 if not metrics['Pass']:
-    st.error(f"🛑 Conclusion: FAIL - {metrics['msg']} (Consider running Auto-Tune FFE or adjusting channel geometry)")
+    st.error(f"🛑 Conclusion: FAIL - {metrics['msg']} (Consider running Auto-Tune or increasing RX CTLE)")
 else:
     st.success(f"🏆 Conclusion: PASS - {metrics['msg']} (Compliant with {mod_type} optical/electrical interface specs)")
 
 if p['skew_ps'] > 0:
     st.warning(f"⚠️ Skew Warning: {p['skew_ps']}ps of intra-pair skew causes an insertion loss null (destructive interference) at {1 / (2 * p['skew_ps'] * 1e-12) / 1e9:.1f} GHz.")
     
-if p['rj_rms_ps'] > 0 or p['sj_amp_ps'] > 0:
-    st.info(f"🕒 Jitter Stress Test Active: Observe the closing Bathtub Curve at BER = 1E-12.")
+if p['ctle_db'] > 0:
+    st.info(f"🧠 RX CTLE Active: Providing {p['ctle_db']} dB of high-frequency peaking to compensate for channel loss.")
 
 st.divider()
 
 plt.style.use('dark_background')
-# 🌟 改為 2x2 陣列佈局 🌟
 fig, axs = plt.subplots(2, 2, figsize=(14, 10), dpi=120)
 fig.patch.set_facecolor('#0e1117') 
 ax1, ax2 = axs[0]
@@ -446,15 +461,15 @@ ax1.set_ylim(40, 140)
 ax1.set_ylabel("Impedance (Ω)")
 ax1.legend(loc='upper right')
 
-# Plot 2: IL
+# Plot 2: IL (Now shows Channel + CTLE combined)
 ax2.plot(f_array/1e9, IL_dB, color='#ffcc00', linewidth=2)
 ax2.axvline(nyq_f, color='red', linestyle='--', alpha=0.5, label=f'Nyquist ({nyq_f} GHz)')
-ax2.set_title("2. Insertion Loss (S21)", loc='left', color='white', fontsize=12)
+ax2.set_title("2. Insertion Loss (Channel + RX CTLE)", loc='left', color='white', fontsize=12)
 ax2.set_xlabel("Frequency (GHz)")
 ax2.set_ylabel("dB")
 ax2.grid(True, color='#333333', linestyle=':')
 ax2.legend(loc='lower left')
-ax2.set_ylim(-80, 5)
+ax2.set_ylim(-80, 10)
 ax2.set_xlim(0, p['fmax'])
 
 # Plot 3: Eye Diagram
@@ -479,7 +494,7 @@ ax3.set_ylim(-1.5, 1.5)
 ax3.grid(True, color='#333333', linestyle=':')
 ax3.legend(loc='upper right')
 
-# Plot 4: Bathtub Curve 🌟
+# Plot 4: Bathtub Curve
 ax4.semilogy(t_bathtub, ber_curve, color='#ff5252', linewidth=2)
 ax4.axhline(1e-12, color='gray', linestyle='--', label='BER Target (1E-12)')
 ax4.set_title("4. Jitter Bathtub Curve (BER vs Time)", loc='left', color='white', fontsize=12)
